@@ -1,104 +1,165 @@
 # ai_client.py
-import os, base64, json
-from typing import Dict
+import os
+import base64
+import json
+import re
+from typing import Dict, Any
+import requests
 
-# SDK ufficiale OpenAI
-from openai import OpenAI
+# Modello vision consigliato (puoi sovrascriverlo via ENV)
+DEFAULT_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
 
-# Modello consigliato (vision, costo basso, ottimo per OCR+parsing)
-OPENAI_MODEL = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
+# Endpoint e chiave: imposta su Render
+# - LLM_API_KEY = <la tua chiave OpenAI>
+# - (opz.) LLM_ENDPOINT = https://api.openai.com/v1/chat/completions
+LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "https://api.openai.com/v1/chat/completions")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 
 def _b64_data_url(image_path: str) -> str:
+    """Converte un file immagine in data URL base64 (JPEG di default)."""
     with open(image_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64}"
 
-def parse_with_ai(image_path: str) -> Dict:
+def _safe_json_parse(text: str) -> Dict[str, Any]:
     """
-    Passa il crop dell'etichetta al modello vision e ottiene:
-      modello, articolo, colore, taglia_fr, barcode
-    Ritorna anche confidenza (stima) e stato (OK/REVIEW).
-    Richiede OPENAI_API_KEY come env su Render.
+    Tenta di leggere JSON puro. Se non è valido, prova ad estrarre il primo blocco {...}.
+    Ritorna dict (o {}).
     """
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        # fallback per non bloccare la pipeline
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", text)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+        return {}
+
+def _normalize_value(s: Any) -> str:
+    if s is None:
+        return ""
+    if isinstance(s, (int, float)):
+        return str(s)
+    return str(s).strip()
+
+def parse_with_ai(image_path: str) -> Dict[str, Any]:
+    """
+    Chiama OpenAI Vision (GPT-4o family) per estrarre i campi dall'etichetta.
+    Ritorna un dict con:
+      - modello, articolo, colore, taglia_fr, barcode
+      - confidenza (0..100), stato (OK/REVIEW)
+    Se la chiave non è configurata, ritorna una risposta 'REVIEW' con campi vuoti.
+    """
+    if not LLM_API_KEY:
         return {
             "modello": "", "articolo": "", "colore": "",
             "taglia_fr": "", "barcode": "",
             "confidenza": 0, "stato": "REVIEW"
         }
 
-    client = OpenAI(api_key=api_key)
-
     data_url = _b64_data_url(image_path)
 
-    # Prompt molto “guidato” per campi Adidas
+    # Prompt “a prova di output”: chiediamo JSON *puro* con chiavi esatte.
     system_msg = (
-        "Sei un parser di etichette scarpe adidas. "
-        "Estrai SOLO i campi richiesti dal testo dell'etichetta: "
-        "modello (es. 'SAMBA OG J' / 'CAMPUS 00s W' / 'SUPERSTAR II'), "
-        "articolo (es. 'IE3675'), "
-        "colore (formato AAA/BBBBB/CCC con numeri ammessi es. 'FTWWHT/CBLACK/GUM5'), "
-        "taglia_fr (formato es. '37 1/3', '36 2/3', ammesse ½ ⅓ ⅔), "
-        "barcode (EAN-13). "
-        "Rispondi JSON puro, con chiavi: modello, articolo, colore, taglia_fr, barcode."
+        "Sei un parser di etichette Adidas. "
+        "Leggi esclusivamente il testo stampato sull'etichetta e restituisci JSON PULITO con queste chiavi: "
+        "modello, articolo, colore, taglia_fr, barcode. "
+        "Non inventare: se un campo non è visibile, lascia stringa vuota."
+    )
+    user_msg = (
+        "Estrai i campi dall'immagine:\n"
+        "- modello (es. 'SAMBA OG J', 'GAZELLE INDOOR W', 'CAMPUS 00s W', 'SUPERSTAR II J')\n"
+        "- articolo (es. IE3675, HQ8708; 1–2 lettere + 4–6 cifre)\n"
+        "- colore (forma AAA/BBBBB/CCC; numeri ammessi es. GUM5)\n"
+        "- taglia_fr (es. '37 1/3', '38 2/3', '40', ammessi ½ ⅓ ⅔)\n"
+        "- barcode (EAN-13 sotto il codice a barre)\n\n"
+        "Rispondi SOLO con JSON, senza testo extra. Esempio:\n"
+        "{"
+        "\"modello\":\"SAMBA OG J\","
+        "\"articolo\":\"IE3675\","
+        "\"colore\":\"FTWWHT/CBLACK/GUM5\","
+        "\"taglia_fr\":\"37 1/3\","
+        "\"barcode\":\"4067886691568\""
+        "}"
     )
 
-    user_instructions = (
-        "Analizza l'immagine e restituisci un JSON con i campi richiesti. "
-        "Se un campo non è visibile, metti stringa vuota."
-    )
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    # Responses API: input multimodale con image_url (data URL)
-    resp = client.responses.create(
-        model=OPENAI_MODEL,
-        input=[
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": system_msg}],
-            },
+    payload = {
+        "model": DEFAULT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": user_instructions},
-                    {"type": "input_image", "image_url": {"url": data_url}},
+                    {"type": "text", "text": user_msg},
+                    {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
         ],
-        # opzionale: temperature bassa per massima fedeltà
-        temperature=0.0,
-    )
-
-    # Estrai il testo della risposta (dovrebbe essere JSON)
-    text = resp.output_text  # SDK nuovo espone output_text
-    try:
-        data = json.loads(text)
-    except Exception:
-        # se non è JSON perfetto, prova una ripulita banale
-        import re
-        json_candidate = re.search(r"\{.*\}", text, re.DOTALL)
-        data = json.loads(json_candidate.group(0)) if json_candidate else {}
-
-    modello   = (data.get("modello") or "").strip()
-    articolo  = (data.get("articolo") or "").strip()
-    colore    = (data.get("colore") or "").strip()
-    taglia_fr = (data.get("taglia_fr") or "").strip()
-    barcode   = (data.get("barcode") or "").strip()
-
-    # Stima confidenza semplice: +20 per ogni campo presente
-    conf = 0
-    for v in [modello, articolo, colore, taglia_fr, barcode]:
-        if v: conf += 20
-
-    stato = "OK" if barcode else "REVIEW"
-
-    return {
-        "modello": modello,
-        "articolo": articolo,
-        "colore": colore,
-        "taglia_fr": taglia_fr,
-        "barcode": barcode,
-        "confidenza": conf,
-        "stato": stato,
+        "temperature": 0.0,
     }
+
+    try:
+        resp = requests.post(LLM_ENDPOINT, headers=headers, json=payload, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Chat Completions: risposta nel primo choice → message.content[0].text (o content string)
+        content = ""
+        try:
+            msg = data["choices"][0]["message"]
+            # Se multimodale, "content" può essere list of parts; prendiamo testo
+            if isinstance(msg.get("content"), list):
+                # nuove API a volte usano parti; cerchiamo il primo blocco text
+                for part in msg["content"]:
+                    if isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                        content = part.get("text", "") or part.get("output_text", "")
+                        if content:
+                            break
+            else:
+                content = msg.get("content", "")
+        except Exception:
+            content = ""
+
+        parsed = _safe_json_parse(content)
+
+        modello   = _normalize_value(parsed.get("modello"))
+        articolo  = _normalize_value(parsed.get("articolo"))
+        colore    = _normalize_value(parsed.get("colore"))
+        taglia_fr = _normalize_value(parsed.get("taglia_fr"))
+        barcode   = _normalize_value(parsed.get("barcode"))
+
+        # Confidenza: +20 per campo presente
+        conf = sum(20 for v in [modello, articolo, colore, taglia_fr, barcode] if v)
+        stato = "OK" if barcode else "REVIEW"
+
+        return {
+            "modello": modello,
+            "articolo": articolo,
+            "colore": colore,
+            "taglia_fr": taglia_fr,
+            "barcode": barcode,
+            "confidenza": conf,
+            "stato": stato,
+        }
+
+    except requests.HTTPError as e:
+        # Errore HTTP dell’API
+        return {
+            "modello": "", "articolo": "", "colore": "",
+            "taglia_fr": "", "barcode": "",
+            "confidenza": 0, "stato": f"REVIEW_HTTP_{e.response.status_code}"
+        }
+    except Exception as e:
+        # Qualunque altra eccezione (timeout, parsing, ecc.)
+        return {
+            "modello": "", "articolo": "", "colore": "",
+            "taglia_fr": "", "barcode": "",
+            "confidenza": 0, "stato": "REVIEW_ERROR"
+        }
